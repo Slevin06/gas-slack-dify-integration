@@ -1,0 +1,16 @@
+# Clasp
+.clasprc.json
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# 環境固有ファイル
+.env
+.env.local
+
+# OS固有ファイル
+.DS_Store
+Thumbs.db
+
+/.idea

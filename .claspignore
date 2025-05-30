@@ -1,0 +1,15 @@
+# TypeScriptソースファイル（JSファイルのみプッシュ）
+**/*.ts
+!**/*.d.ts
+
+# 設定ファイル
+tsconfig.json
+package*.json
+.gitignore
+README.md
+
+# Node.js
+node_modules/
+
+# その他
+.git/
