@@ -38,6 +38,8 @@ const PROCESSED_EVENTS_CACHE = CacheService.getScriptCache();
 
 /**
  * Slackリクエストの署名を検証する
+ * 注意: Google Apps ScriptではHTTPヘッダーの取得に制限があるため、
+ * 署名検証は通常失敗し、トークン認証にフォールバックします。
  * @param {Object} e - doPostのイベントオブジェクト
  * @return {boolean} 検証結果
  */
@@ -59,30 +61,15 @@ function verifySlackRequest(e) {
     }
 
     // Google Apps Scriptでは、HTTPヘッダーは直接アクセスできない場合がある
-    // 代替手段として、Slackが送信するX-Slack-Request-TimestampとX-Slack-Signatureを
-    // クエリパラメータまたは他の方法で取得する必要がある
-
+    // セキュリティ上の理由から、クエリパラメータでの署名取得は行わない
     let timestamp = null;
     let signature = null;
 
-    // 方法1: クエリパラメータから取得を試行
-    if (e.parameter) {
-        timestamp = e.parameter['X-Slack-Request-Timestamp'] || e.parameter['timestamp'];
-        signature = e.parameter['X-Slack-Signature'] || e.parameter['signature'];
-    }
-
-    // 方法2: postDataのheadersから取得を試行（存在する場合）
+    // postDataのheadersから取得を試行（存在する場合のみ）
     if (e.postData && e.postData.headers) {
         const headers = e.postData.headers;
-        timestamp = timestamp || headers['X-Slack-Request-Timestamp'] || headers['x-slack-request-timestamp'];
-        signature = signature || headers['X-Slack-Signature'] || headers['x-slack-signature'];
-    }
-
-    // 方法3: Google Apps Scriptの特殊な方法でヘッダーを取得
-    // GASでは、一部のヘッダーがe.parametersに含まれる場合がある
-    if (e.parameters) {
-        timestamp = timestamp || e.parameters['X-Slack-Request-Timestamp'] || e.parameters['timestamp'];
-        signature = signature || e.parameters['X-Slack-Signature'] || e.parameters['signature'];
+        timestamp = headers['X-Slack-Request-Timestamp'] || headers['x-slack-request-timestamp'];
+        signature = headers['X-Slack-Signature'] || headers['x-slack-signature'];
     }
 
     const body = e.postData ? e.postData.contents : '';
@@ -95,7 +82,7 @@ function verifySlackRequest(e) {
     }
 
     if (!timestamp || !signature) {
-        console.error('Missing required Slack headers. Timestamp:', !!timestamp, 'Signature:', !!signature);
+        console.warn('Missing required Slack headers. This is expected due to Google Apps Script limitations.');
 
         // デバッグ用に利用可能なすべてのプロパティを出力
         if (isDebugMode()) {
@@ -108,16 +95,20 @@ function verifySlackRequest(e) {
             }
         }
 
-        // Google Apps Scriptの制限により、HTTPヘッダーが取得できない場合がある
-        // この場合、Slackの設定でヘッダーをクエリパラメータとして送信するか、
-        // 別の認証方法を検討する必要がある
-        console.warn('Google Apps Script may not have access to HTTP headers. Consider alternative authentication.');
+        // Google Apps Scriptの制限により、HTTPヘッダーが取得できない
+        // この場合、トークン認証を使用する
+        console.info('Falling back to token verification due to GAS header limitations.');
         return false;
     }
 
     // タイムスタンプチェック（リプレイ攻撃防止）
     const currentTime = Math.floor(Date.now() / 1000);
-    const timestampInt = parseInt(timestamp);
+    const timestampInt = parseInt(timestamp, 10);
+    if (isNaN(timestampInt)) {
+        console.error('Invalid timestamp:', timestamp);
+        return false;
+    }
+
     if (Math.abs(currentTime - timestampInt) > CONFIG.REQUEST_TIMESTAMP_TOLERANCE) {
         console.error('Request timestamp is too old. Current:', currentTime, 'Request:', timestampInt);
         return false;
@@ -137,7 +128,11 @@ function verifySlackRequest(e) {
         console.log('Signatures match:', signature === expectedSignature);
     }
 
-    const isValid = signature === expectedSignature;
+    const isValid = Utilities.timingSafeEqual(
+        Utilities.newBlob(signature).getBytes(),
+        Utilities.newBlob(expectedSignature).getBytes()
+    );
+
     if (!isValid) {
         console.error('Signature verification failed');
     }
@@ -245,6 +240,7 @@ function verifySlackToken(slackData) {
 
 /**
  * 複合認証：署名検証またはトークン認証
+ * 実際の運用では、GASの制限により署名検証は失敗し、トークン認証が使用されます。
  * @param {Object} e - doPostのイベントオブジェクト
  * @param {Object} slackData - パースされたSlackデータ
  * @return {boolean} 認証結果
@@ -258,7 +254,7 @@ function authenticateSlackRequest(e, slackData) {
         return true;
     }
 
-    // 1. 署名検証を試行
+    // 1. 署名検証を試行（GASの制限により通常は失敗）
     const signatureValid = verifySlackRequest(e);
     if (signatureValid) {
         if (isDebugMode()) {
@@ -267,7 +263,7 @@ function authenticateSlackRequest(e, slackData) {
         return true;
     }
 
-    // 2. 署名検証が失敗した場合、トークン認証を試行
+    // 2. 署名検証が失敗した場合、トークン認証を試行（実際のメイン認証方式）
     if (isDebugMode()) {
         console.log('Signature verification failed, trying token verification...');
     }
