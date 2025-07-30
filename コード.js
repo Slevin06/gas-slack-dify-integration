@@ -166,7 +166,7 @@ function getEventIdentifier(slackData) {
 }
 
 /**
- * 重複イベントをチェックし、キャッシュに保存する
+ * アトミックな重複イベントチェック（競合状態を防ぐ）
  * @param {string} eventIdentifier - イベント識別子
  * @return {boolean} 重複している場合はtrue
  */
@@ -174,12 +174,59 @@ function isDuplicateEvent(eventIdentifier) {
     if (!eventIdentifier) return false;
 
     const cacheKey = 'slack_event_' + eventIdentifier;
-    if (PROCESSED_EVENTS_CACHE.get(cacheKey)) {
-        return true;
-    }
+    const lockKey = 'lock_' + eventIdentifier;
+    
+    try {
+        // ロック取得を試行（アトミック操作）
+        const existingLock = PROCESSED_EVENTS_CACHE.get(lockKey);
+        if (existingLock) {
+            if (isDebugMode()) {
+                console.log(`Event ${eventIdentifier} is currently being processed by another instance`);
+            }
+            return true; // 他のインスタンスが処理中
+        }
 
-    PROCESSED_EVENTS_CACHE.put(cacheKey, 'true', CONFIG.CACHE_EXPIRATION_SECONDS);
-    return false;
+        // 既に処理済みかチェック
+        const alreadyProcessed = PROCESSED_EVENTS_CACHE.get(cacheKey);
+        if (alreadyProcessed) {
+            if (isDebugMode()) {
+                console.log(`Event ${eventIdentifier} already processed`);
+            }
+            return true; // 既に処理済み
+        }
+
+        // ロックを設定（短期間）
+        PROCESSED_EVENTS_CACHE.put(lockKey, 'processing', 10); // 10秒間のロック
+        
+        // 再度処理済みかチェック（ダブルチェック）
+        const doubleCheck = PROCESSED_EVENTS_CACHE.get(cacheKey);
+        if (doubleCheck) {
+            // ロックを解除
+            PROCESSED_EVENTS_CACHE.remove(lockKey);
+            if (isDebugMode()) {
+                console.log(`Event ${eventIdentifier} processed by another instance during lock acquisition`);
+            }
+            return true;
+        }
+
+        // 処理済みマークを設定
+        PROCESSED_EVENTS_CACHE.put(cacheKey, 'true', CONFIG.CACHE_EXPIRATION_SECONDS);
+        
+        // ロックを解除
+        PROCESSED_EVENTS_CACHE.remove(lockKey);
+        
+        if (isDebugMode()) {
+            console.log(`Event ${eventIdentifier} marked for processing`);
+        }
+        
+        return false; // 重複ではない、処理を続行
+
+    } catch (error) {
+        // エラー時はロックを解除
+        PROCESSED_EVENTS_CACHE.remove(lockKey);
+        console.error('Error in duplicate check:', error);
+        return false; // エラー時は処理を続行（安全側に倒す）
+    }
 }
 
 /**
@@ -317,6 +364,18 @@ function doPost(e) {
         if (slackData.event) {
             // 重複チェック
             const eventIdentifier = getEventIdentifier(slackData);
+            
+            if (isDebugMode()) {
+                console.log(`=== Event Processing Debug ===`);
+                console.log(`Event Identifier: ${eventIdentifier}`);
+                console.log(`Event Type: ${slackData.event.type || 'unknown'}`);
+                console.log(`Channel: ${slackData.event.channel || 'unknown'}`);
+                console.log(`Timestamp: ${slackData.event.ts || 'unknown'}`);
+                console.log(`Client Message ID: ${slackData.event.client_msg_id || 'none'}`);
+                console.log(`Event ID: ${slackData.event_id || 'none'}`);
+                console.log(`Processing time: ${new Date().toISOString()}`);
+            }
+            
             if (eventIdentifier && isDuplicateEvent(eventIdentifier)) {
                 console.log(`Duplicate event detected: ${eventIdentifier}`);
                 return ContentService.createTextOutput('OK - Already processed')
