@@ -33,8 +33,6 @@ const CONFIG = {
  * - 署名検証は自動的に失敗し、トークン認証にフォールバックします
  */
 
-// CacheServiceを取得（スクリプト全体で共有）
-const PROCESSED_EVENTS_CACHE = CacheService.getScriptCache();
 
 /**
  * Slackリクエストの署名を検証する
@@ -166,66 +164,49 @@ function getEventIdentifier(slackData) {
 }
 
 /**
- * アトミックな重複イベントチェック（競合状態を防ぐ）
+ * 重複イベントチェックをPropertiesServiceとLockServiceを使って堅牢に行う
  * @param {string} eventIdentifier - イベント識別子
  * @return {boolean} 重複している場合はtrue
  */
 function isDuplicateEvent(eventIdentifier) {
     if (!eventIdentifier) return false;
 
-    const cacheKey = 'slack_event_' + eventIdentifier;
-    const lockKey = 'lock_' + eventIdentifier;
-    
-    try {
-        // ロック取得を試行（アトミック操作）
-        const existingLock = PROCESSED_EVENTS_CACHE.get(lockKey);
-        if (existingLock) {
-            if (isDebugMode()) {
-                console.log(`Event ${eventIdentifier} is currently being processed by another instance`);
-            }
-            return true; // 他のインスタンスが処理中
-        }
+    const lock = LockService.getScriptLock();
+    // 5秒間ロックの取得を試みる
+    if (!lock.tryLock(5000)) {
+        console.warn(`Could not acquire lock for event: ${eventIdentifier}. Assuming it is being processed elsewhere.`);
+        return true; // ロックが取得できない場合は、他のプロセスが処理中とみなす
+    }
 
-        // 既に処理済みかチェック
-        const alreadyProcessed = PROCESSED_EVENTS_CACHE.get(cacheKey);
-        if (alreadyProcessed) {
+    try {
+        const properties = PropertiesService.getScriptProperties();
+        const propertyKey = 'event_id_' + eventIdentifier;
+
+        // 既にプロパティが存在するかチェック
+        if (properties.getProperty(propertyKey)) {
             if (isDebugMode()) {
-                console.log(`Event ${eventIdentifier} already processed`);
+                console.log(`Duplicate event detected by PropertiesService: ${eventIdentifier}`);
             }
             return true; // 既に処理済み
         }
 
-        // ロックを設定（短期間）
-        PROCESSED_EVENTS_CACHE.put(lockKey, 'processing', 10); // 10秒間のロック
-        
-        // 再度処理済みかチェック（ダブルチェック）
-        const doubleCheck = PROCESSED_EVENTS_CACHE.get(cacheKey);
-        if (doubleCheck) {
-            // ロックを解除
-            PROCESSED_EVENTS_CACHE.remove(lockKey);
-            if (isDebugMode()) {
-                console.log(`Event ${eventIdentifier} processed by another instance during lock acquisition`);
-            }
-            return true;
-        }
+        // 処理済みとしてプロパティを設定（タイムスタンプを保存）
+        // 注意: PropertiesServiceの合計サイズには上限(500KB)があるため、定期的なクリーンアップが必要になる可能性がある
+        properties.setProperty(propertyKey, Date.now().toString());
 
-        // 処理済みマークを設定
-        PROCESSED_EVENTS_CACHE.put(cacheKey, 'true', CONFIG.CACHE_EXPIRATION_SECONDS);
-        
-        // ロックを解除
-        PROCESSED_EVENTS_CACHE.remove(lockKey);
-        
         if (isDebugMode()) {
-            console.log(`Event ${eventIdentifier} marked for processing`);
+            console.log(`Event ${eventIdentifier} marked as processed in PropertiesService.`);
         }
-        
-        return false; // 重複ではない、処理を続行
 
-    } catch (error) {
-        // エラー時はロックを解除
-        PROCESSED_EVENTS_CACHE.remove(lockKey);
-        console.error('Error in duplicate check:', error);
-        return false; // エラー時は処理を続行（安全側に倒す）
+        return false; // 重複ではない
+
+    } catch (e) {
+        console.error(`Error during duplicate check with LockService/PropertiesService for event ${eventIdentifier}: ${e}`);
+        // エラーが発生した場合は、安全のために処理を続行しない（重複の可能性があるため）
+        return true;
+    } finally {
+        // 必ずロックを解放する
+        lock.releaseLock();
     }
 }
 
@@ -477,4 +458,54 @@ function callDifyWorkflow(slackEvent) {
     } catch (error) {
         console.error('Failed to call Dify API (UrlFetchApp error):', error);
     }
+}
+
+/**
+ * 古いプロパティを定期的に削除する関数
+ * 30日以上経過したイベントIDのプロパティを削除してPropertiesServiceの容量を確保する
+ */
+function cleanupOldProperties() {
+    console.log('Starting old properties cleanup...');
+    const properties = PropertiesService.getScriptProperties();
+    const allKeys = properties.getKeys();
+    const now = Date.now();
+    const THIRTY_DAYS_IN_MS = 30 * 24 * 60 * 60 * 1000;
+    let deletedCount = 0;
+
+    allKeys.forEach(key => {
+        if (key.startsWith('event_id_')) {
+            const propertyValue = properties.getProperty(key);
+            const timestamp = parseInt(propertyValue, 10);
+
+            if (!isNaN(timestamp) && (now - timestamp > THIRTY_DAYS_IN_MS)) {
+                properties.deleteProperty(key);
+                deletedCount++;
+            }
+        }
+    });
+    console.log(`Cleanup finished. Deleted ${deletedCount} old properties.`);
+}
+
+/**
+ * クリーンアップ関数のトリガーを自動設定する
+ * 注意: この関数はSlackリクエスト処理中に実行しないこと（パフォーマンス低下を防ぐため）
+ * デプロイ後に開発者が手動で一度だけ実行する
+ */
+function setupTriggers() {
+    // 既存の関連トリガーを削除
+    const allTriggers = ScriptApp.getProjectTriggers();
+    for (const trigger of allTriggers) {
+        if (trigger.getHandlerFunction() === 'cleanupOldProperties') {
+            ScriptApp.deleteTrigger(trigger);
+        }
+    }
+
+    // 新しく時間主導型のトリガーを作成
+    ScriptApp.newTrigger('cleanupOldProperties')
+        .timeBased()
+        .everyDays(1)
+        .atHour(3)
+        .create();
+
+    console.log('Trigger for cleanupOldProperties has been set up to run daily at 3 AM.');
 }
